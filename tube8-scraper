@@ -1,0 +1,150 @@
+#!/bin/bash
+# by Dominik Stanisław Suchora <suchora.dominik7@gmail.com>
+# License: GNU GPLv3
+
+ucurl() {
+    curl -L -g -s --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) QtWebEngine/5.15.2 Chrome/87.0.4280.144 Safari/537.36' -H 'Accept-Encoding: gzip, deflate' --compressed -H 'Cookie: t8disclaimer=1' "$@"
+}
+
+declare threads='4' cookie_t
+
+usage() {
+    printf '%s [OPTION...] [URL]...\n' "$(basename "$0")"
+    printf 'Archive tube8 videos, channels and pornstars metadata in json from its sitemap and urls.\n'
+    printf 'Download functions are matched to URL.\n'
+    printf 'Data will be saved in files named by sha256 hash of their urls.\n\n'
+    printf 'Options:\n  -d,\t--dir DIR\t\tchange directory to DIR\n'
+    printf '  -t,\t--threads NUM\t\tset number of used threads, by default set to 4\n'
+    printf '  -p,\t--pornstar URL\t\tpass URL as pornstar\n'
+    printf '  -P,\t--pornstars\t\tdownload all pornstars from sitemap\n'
+    printf '  -v,\t--video URL\t\tpass URL as video\n'
+    printf '  -V,\t--videos\t\tdownload all videos from sitemap\n'
+    printf '  -c,\t--channel URL\t\tpass URL as channel\n'
+    printf '  -C,\t--channels\t\tdownload all channels from sitemap\n'
+    printf '  -h,\t--help\t\t\tshow help\n'
+}
+
+get_video() {
+    local -r rh="$(sha256sum <<< "$1")"
+    local -r name="${rh%  *}"
+    [ -e "$name" ] && return
+    echo "$1" >&2
+    local id="${1%/}"
+    id="${id##*/}"
+    ucurl -c "$cookie_t" "$1" | tr -d '\n\r\t' | reliq '
+        .title h1 .videoTitle | "%i\n",
+        .rating span .tm_rating_percent | "%i",
+        .views div .feature-actionViews; span .infoValue | "%i",
+        .featured div .video-featured; span | "%i",
+        .uploaded div .video-uploaded; span | "%i",
+        div .video-uploaderInfoPanel; {
+            .author_avatar img .userAvatar src | "%(src)v",
+            .author_link a c@[0] href | "https://www.tube8.com%(href)v",
+            .author_name a c@[0] href | "%i",
+            .author_id.u button data-entityId | "%(data-entityId)v"
+        },
+        .thumbnail meta property=og:image content | "%(content)v\n",
+        .duration.u meta property=video:duration content | "%(content)v",
+        .pornstars div #metaDataPornstarInfo; div .title-wrapper; a href; {
+           .name * c@[0] | "%i",
+           .link * l@[0] | "https://www.tube8.com%(href)v"
+        } | ,
+        .categories.a div .videoTags; a href=a>"/cat/" | "%i\n",
+        .tags.a div .videoTags; a href=a>"/porntags/" | "%i\n"
+    ' | jq -srcM --arg 'link' "$1" --arg "id" "$id" '{"link":$link,"id":($id|tonumber)}+.[0]' > "$name"
+}
+
+get_pornstar() {
+    local -r rh="$(sha256sum <<< "$1")"
+    local -r name="${rh%  *}"
+    [ -e "$name" ] && return
+    echo "$1" >&2
+    ucurl "$1" | tr -d '\n\t\r\a' | reliq '
+        div .pornstar-info-wrapper; {
+            .name h1 .porn-star-name | "%i",
+            .image div .pornstar-image-wrapper; img data-src | "%(data-src)v",
+            .subscribers.u div .subscribers-count; span .count | "%i",
+            .id.u div .pornstar-subscription; button data-entityId | "%(data-entityId)v",
+            .info_pieces div .porn-star-info-stats; li; {
+                .key label | "%i",
+                .value span | "%i"
+            } | ,
+            div .porn-star-stats; span i@Eft>"[0-9]+"; {
+                .rank.u [0] * l@[0] | "%i",
+                .videos.u [1] * l@[0] | "%i",
+                .views.u [2] * l@[0] | "%i"
+            }
+        }
+    ' | jq -srcM --arg 'link' "$1" '{"link":$link}+.[0]' > "$name"
+}
+
+get_channel() {
+    local -r rh="$(sha256sum <<< "$1")"
+    local -r name="${rh%  *}"
+    [ -e "$name" ] && return
+    echo "$1" >&2
+    ucurl "$1" | tr -d '\n\t\r\a' | reliq '
+        h1 .title-text; {
+            .name * l@[0] | "%i" / sed "s/  .*//",
+            .id.u button data-entityId | "%(data-entityId)v",
+        },
+        .channel div .title-bar [0]; a target=_blank href | "%(href)v",
+        .rank.u div .channel-rank; div .rank | "%i",
+        .description div .channel-description; p | "%i",
+        div .channel-sideBar; div .channel-info; div .info-metrics; {
+            .videos.u [0] * l@[0] | "%i" tr ",",
+            .views.u [1] * l@[0] | "%i" tr ",",
+            .subscribers.u [2] * l@[0] | "%i" tr ",",
+        }
+    ' | jq -srcM --arg 'link' "$1" '{"link":$link}+.[0]' > "$name"
+}
+
+get_from_sitemap() {
+    for i in $(ucurl 'https://www.tube8.com/sitemap.xml' | reliq 'loc i@E>"/sitemap-'"$1"'.*\.xml" | "%i\n"')
+    do
+        for j in $(ucurl "$i" | reliq 'loc | "%i\n"')
+        do
+            [ "$(jobs | wc -l)" -gt "$threads" ] && wait %%
+            "$2" "$j" &
+        done
+        wait
+    done
+}
+
+[ "$#" -eq '0' ] && { usage >&2; exit 1; }
+
+cookie_t="$(mktemp)"
+trap 'rm "$cookie_t"; exit'  HUP INT QUIT TERM PWR EXIT
+
+while [ "$#" -gt 0 ]
+do
+    case "$1" in
+        -d|--dir) cd "$2" || exit; shift;;
+        -t|--threads) threads="$2"; shift;;
+        -p|--pornstar) get_pornstar "$2"; shift;;
+        -P|--pornstars) get_from_sitemap 'pornstars' 'get_pornstar';;
+        -v|--video) get_video "$2"; shift;;
+        -V|--videos) get_from_sitemap 'video-[0-9]+' 'get_video';;
+        -c|--channel) get_channel "$2"; shift;;
+        -C|--channels) get_from_sitemap 'channels' 'get_channel';;
+        -h|--help) usage; exit 0;;
+        -*) printf '%s: invalid argument -- %s\n' "$(basename "$0")" "$1" >&2; exit 1;;
+        *) break;;
+    esac
+    shift
+done
+
+while [ "$#" -gt 0 ]
+do
+    case "$1" in
+        https://www.tube8.com/porn-video/*|https://www.tube8.com/gay/porn-video/*)
+            get_video "$1";;
+        https://www.tube8.com/pornstar/*|https://www.tube8.com/gay/pornstar/*)
+            get_pornstar "$1";;
+        https://www.tube8.com/channel/*|https://www.tube8.com/gay/channel/*)
+            get_channel "$1";;
+        *)
+            printf 'unsupported url "%s"\n' "$1";;
+    esac
+    shift
+done
